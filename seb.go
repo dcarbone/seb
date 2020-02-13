@@ -43,22 +43,34 @@ func newWorker(fn EventHandler) *worker {
 
 func (nw *worker) close() {
 	nw.mu.Lock()
-	defer nw.mu.Unlock()
 
 	if nw.closed {
+		nw.mu.Unlock()
 		return
 	}
 
 	nw.closed = true
+
 	close(nw.in)
 	close(nw.out)
 	if len(nw.in) > 0 {
 		for range nw.in {
 		}
 	}
+
+	nw.mu.Unlock()
 }
 
 func (nw *worker) publish() {
+	var (
+		wait *time.Timer
+	)
+	defer func() {
+		if !wait.Stop() {
+			<-wait.C
+		}
+	}()
+
 	for n := range nw.in {
 		// todo: it is probably not necessary to test here as if the worker is closed between this event
 		// being processed and the next event in, it is removed from the map of available workers to push
@@ -69,15 +81,21 @@ func (nw *worker) publish() {
 			return
 		}
 
+		// either construct timer or reset existing
+		if wait == nil {
+			wait = time.NewTimer(5 * time.Second)
+		} else {
+			wait.Reset(5 * time.Second)
+		}
+
 		// attempt to push message to consumer, allowing for up to 5 seconds of blocking
 		// if block window passes, drop on floor
-		waitForConsumer := time.NewTimer(5 * time.Second)
 		select {
 		case nw.out <- n:
-			if !waitForConsumer.Stop() {
-				<-waitForConsumer.C
+			if !wait.Stop() {
+				<-wait.C
 			}
-		case <-waitForConsumer.C:
+		case <-wait.C:
 		}
 
 		nw.mu.RUnlock()
@@ -124,8 +142,8 @@ func New() *Bus {
 }
 
 // Push will immediately send a new event to all currently registered recipients
-func (eb *Bus) Push(topic string, d interface{}) {
-	eb.sendEvent(topic, d)
+func (b *Bus) Push(topic string, d interface{}) {
+	b.sendEvent(topic, d)
 }
 
 // AttachHandler immediately adds the provided fn to the list of recipients for new events.
@@ -134,7 +152,7 @@ func (eb *Bus) Push(topic string, d interface{}) {
 // - panic if fn is nil
 // - generate random ID if provided ID is empty
 // - return "true" if there was an existing recipient with the same identifier
-func (eb *Bus) AttachHandler(id string, fn EventHandler) (string, bool) {
+func (b *Bus) AttachHandler(id string, fn EventHandler) (string, bool) {
 	if fn == nil {
 		panic(fmt.Sprintf("AttachHandler called with id %q and nil handler", id))
 	}
@@ -143,18 +161,20 @@ func (eb *Bus) AttachHandler(id string, fn EventHandler) (string, bool) {
 		replaced bool
 	)
 
-	eb.mu.Lock()
-	defer eb.mu.Unlock()
+	b.mu.Lock()
+	defer b.mu.Unlock()
 
 	if id == "" {
-		id = strconv.FormatInt(eb.rs.Int63(), 10)
+		id = strconv.FormatInt(b.rs.Int63(), 10)
 	}
-	w, replaced = eb.ws[id]
 
-	eb.ws[id] = newWorker(fn)
+	w, replaced = b.ws[id]
 	if replaced {
 		w.close()
 	}
+
+	b.ws[id] = newWorker(fn)
+
 	return id, replaced
 }
 
@@ -165,63 +185,66 @@ func (eb *Bus) AttachHandler(id string, fn EventHandler) (string, bool) {
 // - panic if ch is nil
 // - generate random ID if provided ID is empty
 // - return "true" if there was an existing recipient with the same identifier
-func (eb *Bus) AttachChannel(id string, ch EventChannel) (string, bool) {
+func (b *Bus) AttachChannel(id string, ch EventChannel) (string, bool) {
 	if ch == nil {
 		panic(fmt.Sprintf("AttachChannel called with id %q and nil channel", id))
 	}
-	return eb.AttachHandler(id, func(n Event) {
+	return b.AttachHandler(id, func(n Event) {
 		ch <- n
 	})
 }
 
 // DetachRecipient immediately removes the provided recipient from receiving any new events,
 // returning true if a recipient was found with the provided id
-func (eb *Bus) DetachRecipient(id string) bool {
+func (b *Bus) DetachRecipient(id string) bool {
 	var (
 		w  *worker
 		ok bool
 	)
 
-	eb.mu.Lock()
-	defer eb.mu.Unlock()
+	b.mu.Lock()
+	defer b.mu.Unlock()
 
-	if w, ok = eb.ws[id]; ok {
+	if w, ok = b.ws[id]; ok {
 		w.close()
 	}
-	delete(eb.ws, id)
+	delete(b.ws, id)
 
 	return ok
 }
 
 // DetachAllRecipients immediately clears all attached recipients, returning the count of those previously
 // attached.
-func (eb *Bus) DetachAllRecipients() int {
-	eb.mu.Lock()
+func (b *Bus) DetachAllRecipients() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 
-	cnt := len(eb.ws)
-	current := eb.ws
-	eb.ws = make(map[string]*worker)
+	// count how many are in there right now
+	cnt := len(b.ws)
 
-	eb.mu.Unlock()
-
-	for _, w := range current {
+	// asynchronously close them all
+	for _, w := range b.ws {
 		go w.close()
 	}
+
+	b.ws = make(map[string]*worker)
 
 	return cnt
 }
 
 // sendEvent immediately calls each handler with the new event
-func (eb *Bus) sendEvent(t string, d interface{}) {
+func (b *Bus) sendEvent(t string, d interface{}) {
 	n := Event{
-		ID:         strconv.FormatInt(eb.rs.Int63(), 10),
+		ID:         strconv.FormatInt(b.rs.Int63(), 10),
 		Originated: time.Now().UnixNano(),
 		Topic:      t,
 		Data:       d,
 	}
-	eb.mu.RLock()
-	for _, w := range eb.ws {
+
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+
+	for _, w := range b.ws {
 		w.push(n)
 	}
-	eb.mu.RUnlock()
 }
