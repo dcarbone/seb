@@ -26,17 +26,15 @@ type EventChannel chan Event
 type worker struct {
 	mu     sync.RWMutex
 	closed bool
-	id     string
 	in     chan Event
 	out    chan Event
 	fn     EventHandler
 }
 
-func newWorker(id string, fn EventHandler) *worker {
+func newWorker(fn EventHandler) *worker {
 	nw := new(worker)
 	nw.in = make(chan Event, 100)
 	nw.out = make(chan Event)
-	nw.id = id
 	nw.fn = fn
 	go nw.publish()
 	go nw.process()
@@ -153,7 +151,7 @@ func (eb *Bus) AttachHandler(id string, fn EventHandler) (string, bool) {
 	}
 	w, replaced = eb.ws[id]
 
-	eb.ws[id] = newWorker(id, fn)
+	eb.ws[id] = newWorker(fn)
 	if replaced {
 		w.close()
 	}
