@@ -200,7 +200,7 @@ func (b *Bus) DetachRecipient(id string) bool {
 	defer b.mu.Unlock()
 
 	if w, ok := b.ws[id]; ok {
-		w.close()
+		go w.close()
 		delete(b.ws, id)
 		return ok
 	}
