@@ -222,7 +222,7 @@ func (b *Bus) DetachAllRecipients() int {
 	// count how many are in there right now
 	cnt := len(b.ws)
 
-	// asynchronously close them all
+	// close all current in separate goroutine
 	for _, w := range b.ws {
 		go w.close()
 	}
