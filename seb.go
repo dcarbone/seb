@@ -254,11 +254,9 @@ func (eb *Bus) DetachAllRecipients(wait bool) int {
 
 	eb.mu.Unlock()
 
-	go func() {
-		for _, w := range current {
-			w.close()
-		}
-	}()
+	for _, w := range current {
+		go w.close()
+	}
 
 	if wait {
 		eb.wg.Wait()
