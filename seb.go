@@ -62,11 +62,10 @@ func (nw *worker) close() {
 }
 
 func (nw *worker) publish() {
-	var (
-		wait *time.Timer
-	)
+	var wait *time.Timer
+
 	defer func() {
-		if !wait.Stop() {
+		if wait != nil && !wait.Stop() {
 			<-wait.C
 		}
 	}()
