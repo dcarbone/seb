@@ -23,27 +23,20 @@ type EventHandler func(Event)
 // EventChannel can be provided to a Bus to have new Events pushed to it
 type EventChannel chan Event
 
-type EventAttachResult struct {
-	ID        string
-	Overwrote bool
-}
-
 type worker struct {
 	mu     sync.RWMutex
 	closed bool
-	wg     *sync.WaitGroup
 	id     string
 	in     chan Event
 	out    chan Event
 	fn     EventHandler
 }
 
-func newWorker(id string, wg *sync.WaitGroup, fn EventHandler) *worker {
+func newWorker(id string, fn EventHandler) *worker {
 	nw := new(worker)
 	nw.in = make(chan Event, 100)
 	nw.out = make(chan Event)
 	nw.id = id
-	nw.wg = wg
 	nw.fn = fn
 	go nw.publish()
 	go nw.process()
@@ -99,9 +92,6 @@ func (nw *worker) process() {
 	for n := range nw.out {
 		nw.fn(n)
 	}
-
-	// mark done only after nw.out loop has exited
-	nw.wg.Done()
 }
 
 func (nw *worker) push(n Event) {
@@ -124,7 +114,6 @@ func (nw *worker) push(n Event) {
 type Bus struct {
 	mu sync.RWMutex
 	ws map[string]*worker
-	wg *sync.WaitGroup
 	rs rand.Source
 }
 
@@ -132,7 +121,6 @@ type Bus struct {
 func New() *Bus {
 	b := new(Bus)
 	b.ws = make(map[string]*worker)
-	b.wg = new(sync.WaitGroup)
 	b.rs = rand.NewSource(time.Now().UnixNano())
 	return b
 }
@@ -160,35 +148,16 @@ func (eb *Bus) AttachHandler(id string, fn EventHandler) (string, bool) {
 	eb.mu.Lock()
 	defer eb.mu.Unlock()
 
-	eb.wg.Add(1)
-
 	if id == "" {
 		id = strconv.FormatInt(eb.rs.Int63(), 10)
 	}
 	w, replaced = eb.ws[id]
 
-	eb.ws[id] = newWorker(id, eb.wg, fn)
+	eb.ws[id] = newWorker(id, fn)
 	if replaced {
 		w.close()
 	}
 	return id, replaced
-}
-
-// AttachHandlers allows you to attach 1 or more event handlers at a time
-func (eb *Bus) AttachHandlers(fns ...EventHandler) []EventAttachResult {
-	l := len(fns)
-	if l == 0 {
-		return nil
-	}
-
-	results := make([]EventAttachResult, l, l)
-	for i, fn := range fns {
-		res := new(EventAttachResult)
-		res.ID, res.Overwrote = eb.AttachHandler("", fn)
-		results[i] = *res
-	}
-
-	return results
 }
 
 // AttachChannel immediately adds the provided channel to the list of recipients for new
@@ -205,23 +174,6 @@ func (eb *Bus) AttachChannel(id string, ch EventChannel) (string, bool) {
 	return eb.AttachHandler(id, func(n Event) {
 		ch <- n
 	})
-}
-
-// AttachChannels will attempt to attach multiple channels at once
-func (eb *Bus) AttachChannels(chs ...EventChannel) []EventAttachResult {
-	l := len(chs)
-	if l == 0 {
-		return nil
-	}
-
-	results := make([]EventAttachResult, l, l)
-	for i, ch := range chs {
-		res := new(EventAttachResult)
-		res.ID, res.Overwrote = eb.AttachChannel("", ch)
-		results[i] = *res
-	}
-
-	return results
 }
 
 // DetachRecipient immediately removes the provided recipient from receiving any new events,
@@ -245,7 +197,7 @@ func (eb *Bus) DetachRecipient(id string) bool {
 
 // DetachAllRecipients immediately clears all attached recipients, returning the count of those previously
 // attached.
-func (eb *Bus) DetachAllRecipients(wait bool) int {
+func (eb *Bus) DetachAllRecipients() int {
 	eb.mu.Lock()
 
 	cnt := len(eb.ws)
@@ -256,10 +208,6 @@ func (eb *Bus) DetachAllRecipients(wait bool) int {
 
 	for _, w := range current {
 		go w.close()
-	}
-
-	if wait {
-		eb.wg.Wait()
 	}
 
 	return cnt
