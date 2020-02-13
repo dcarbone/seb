@@ -168,8 +168,7 @@ func (b *Bus) AttachHandler(id string, fn EventHandler) (string, bool) {
 		id = strconv.FormatInt(b.rs.Int63(), 10)
 	}
 
-	w, replaced = b.ws[id]
-	if replaced {
+	if w, replaced = b.ws[id]; replaced {
 		w.close()
 	}
 
@@ -197,20 +196,16 @@ func (b *Bus) AttachChannel(id string, ch EventChannel) (string, bool) {
 // DetachRecipient immediately removes the provided recipient from receiving any new events,
 // returning true if a recipient was found with the provided id
 func (b *Bus) DetachRecipient(id string) bool {
-	var (
-		w  *worker
-		ok bool
-	)
-
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	if w, ok = b.ws[id]; ok {
+	if w, ok := b.ws[id]; ok {
 		w.close()
+		delete(b.ws, id)
+		return ok
 	}
-	delete(b.ws, id)
 
-	return ok
+	return false
 }
 
 // DetachAllRecipients immediately clears all attached recipients, returning the count of those previously
