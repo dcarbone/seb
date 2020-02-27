@@ -126,6 +126,30 @@ func (nw *worker) push(n Event) {
 	}
 }
 
+type lockableRandSource struct {
+	mu  sync.Mutex
+	src rand.Source
+}
+
+func newLockableRandSource() *lockableRandSource {
+	s := new(lockableRandSource)
+	s.src = rand.NewSource(time.Now().UnixNano())
+	return s
+}
+
+func (s *lockableRandSource) Int63() int64 {
+	s.mu.Lock()
+	v := s.src.Int63()
+	s.mu.Unlock()
+	return v
+}
+
+func (s *lockableRandSource) Seed(v int64) {
+	s.mu.Lock()
+	s.src.Seed(v)
+	s.mu.Unlock()
+}
+
 type Bus struct {
 	mu sync.RWMutex
 	ws map[string]*worker
@@ -136,7 +160,7 @@ type Bus struct {
 func New() *Bus {
 	b := new(Bus)
 	b.ws = make(map[string]*worker)
-	b.rs = rand.NewSource(time.Now().UnixNano())
+	b.rs = newLockableRandSource()
 	return b
 }
 
