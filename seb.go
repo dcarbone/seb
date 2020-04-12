@@ -1,4 +1,4 @@
-package goseb
+package seb
 
 import (
 	"fmt"
