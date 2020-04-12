@@ -8,6 +8,12 @@ import (
 	"time"
 )
 
+var GlobalBus *Bus
+
+func init() {
+	GlobalBus = New()
+}
+
 // Event describes a specific event with associated data that gets pushed to any registered recipients at the
 // time of push
 type Event struct {
