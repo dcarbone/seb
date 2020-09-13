@@ -1,6 +1,8 @@
 package seb
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"math/rand"
 	"strconv"
@@ -8,13 +10,31 @@ import (
 	"time"
 )
 
+var RecipientNotFoundErr = errors.New("target recipient not found")
+
+func IsRecipientNotFoundErr(err error) bool {
+	for err != nil {
+		if err == RecipientNotFoundErr {
+			return true
+		}
+		err = errors.Unwrap(err)
+	}
+	return false
+}
+
+type Reply struct {
+	Data interface{}
+	Err  error
+}
+
 // Event describes a specific event with associated data that gets pushed to any registered recipients at the
 // time of push
 type Event struct {
-	ID         string // random
-	Originated int64  // unixnano timestamp of when this event was created
-	Topic      string
-	Data       interface{} // no attempt is made to prevent memory sharing
+	ID         string       // random
+	Originated int64        // unixnano timestamp of when this event was created
+	Topic      string       // topic of event
+	Data       interface{}  // no attempt is made to prevent memory sharing
+	Reply      chan<- Reply // if defined, hints to recipients that a response is desired.
 }
 
 // EventHandler can be provided to a Bus to be called per Event
@@ -25,14 +45,16 @@ type EventChannel chan Event
 
 type worker struct {
 	mu     sync.RWMutex
+	id     string
 	closed bool
 	in     chan Event
 	out    chan Event
 	fn     EventHandler
 }
 
-func newWorker(fn EventHandler) *worker {
+func newWorker(id string, fn EventHandler) *worker {
 	nw := new(worker)
+	nw.id = id
 	nw.in = make(chan Event, 100)
 	nw.out = make(chan Event)
 	nw.fn = fn
@@ -65,7 +87,7 @@ func (nw *worker) publish() {
 	var wait *time.Timer
 
 	defer func() {
-		if wait != nil && !wait.Stop() {
+		if wait != nil && !wait.Stop() && len(wait.C) > 0 {
 			<-wait.C
 		}
 	}()
@@ -165,8 +187,24 @@ func New() *Bus {
 }
 
 // Push will immediately send a new event to all currently registered recipients
-func (b *Bus) Push(topic string, d interface{}) {
-	b.sendEvent(topic, d)
+func (b *Bus) Push(topic string, data interface{}) {
+	b.sendEvent(b.buildEvent(topic, data))
+}
+
+// PushTo attempts to push an even to a specific recipient
+func (b *Bus) PushTo(to, topic string, data interface{}) bool {
+	return b.sendEventTo(to, b.buildEvent(topic, data))
+}
+
+// Request will publish a new event with the Reply chan defined, blocking until a single response has been received
+// or the provided context expires
+func (b *Bus) Request(ctx context.Context, topic string, data interface{}) (Reply, error) {
+	return b.doRequest(ctx, "", topic, data)
+}
+
+// RequestFrom attempts to request a response from a specific recipient
+func (b *Bus) RequestFrom(ctx context.Context, to, topic string, data interface{}) (Reply, error) {
+	return b.doRequest(ctx, to, topic, data)
 }
 
 // AttachHandler immediately adds the provided fn to the list of recipients for new events.
@@ -195,7 +233,7 @@ func (b *Bus) AttachHandler(id string, fn EventHandler) (string, bool) {
 		w.close()
 	}
 
-	b.ws[id] = newWorker(fn)
+	b.ws[id] = newWorker(id, fn)
 
 	return id, replaced
 }
@@ -250,19 +288,57 @@ func (b *Bus) DetachAllRecipients() int {
 	return cnt
 }
 
-// sendEvent immediately calls each handler with the new event
-func (b *Bus) sendEvent(t string, d interface{}) {
+func (b *Bus) buildEvent(t string, d interface{}) Event {
 	n := Event{
 		ID:         strconv.FormatInt(b.rs.Int63(), 10),
 		Originated: time.Now().UnixNano(),
 		Topic:      t,
 		Data:       d,
 	}
+	return n
+}
 
+// sendEvent immediately calls each handler with the new event
+func (b *Bus) sendEvent(ev Event) {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 
 	for _, w := range b.ws {
-		w.push(n)
+		w.push(ev)
+	}
+}
+
+func (b *Bus) sendEventTo(to string, ev Event) bool {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	if w, ok := b.ws[to]; ok {
+		w.push(ev)
+		return true
+	}
+	return false
+}
+
+func (b *Bus) doRequest(ctx context.Context, to, topic string, data interface{}) (Reply, error) {
+	ch := make(chan Reply)
+	defer close(ch)
+
+	ev := b.buildEvent(topic, data)
+	ev.Reply = ch
+
+	if err := ctx.Err(); err != nil {
+		return Reply{Err: err}, err
+	}
+
+	if to == "" {
+		b.sendEvent(ev)
+	} else if !b.sendEventTo(to, ev) {
+		return Reply{}, RecipientNotFoundErr
+	}
+
+	select {
+	case resp := <-ch:
+		return resp, nil
+	case <-ctx.Done():
+		return Reply{}, ctx.Err()
 	}
 }
