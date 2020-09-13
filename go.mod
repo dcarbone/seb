@@ -1,3 +1,3 @@
-module github.com/dcarbone/go-seb
+module github.com/dcarbone/seb
 
 go 1.15
