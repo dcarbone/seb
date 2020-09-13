@@ -1,4 +1,4 @@
-# go-seb
+# seb
 Simple event bus written in go
 
 This is designed with the following primary goals:

@@ -10,6 +10,12 @@ import (
 	"time"
 )
 
+var GlobalBus *Bus
+
+func init() {
+	GlobalBus = New()
+}
+
 var RecipientNotFoundErr = errors.New("target recipient not found")
 
 func IsRecipientNotFoundErr(err error) bool {
@@ -192,7 +198,7 @@ func (b *Bus) Push(topic string, data interface{}) {
 }
 
 // PushTo attempts to push an even to a specific recipient
-func (b *Bus) PushTo(to, topic string, data interface{}) bool {
+func (b *Bus) PushTo(to, topic string, data interface{}) error {
 	return b.sendEventTo(to, b.buildEvent(topic, data))
 }
 
@@ -308,14 +314,14 @@ func (b *Bus) sendEvent(ev Event) {
 	}
 }
 
-func (b *Bus) sendEventTo(to string, ev Event) bool {
+func (b *Bus) sendEventTo(to string, ev Event) error {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 	if w, ok := b.ws[to]; ok {
 		w.push(ev)
-		return true
+		return nil
 	}
-	return false
+	return RecipientNotFoundErr
 }
 
 func (b *Bus) doRequest(ctx context.Context, to, topic string, data interface{}) (Reply, error) {
@@ -331,8 +337,8 @@ func (b *Bus) doRequest(ctx context.Context, to, topic string, data interface{})
 
 	if to == "" {
 		b.sendEvent(ev)
-	} else if !b.sendEventTo(to, ev) {
-		return Reply{}, RecipientNotFoundErr
+	} else if err := b.sendEventTo(to, ev); err != nil {
+		return Reply{}, err
 	}
 
 	select {
