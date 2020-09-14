@@ -244,6 +244,14 @@ func (b *Bus) AttachHandler(id string, fn EventHandler) (string, bool) {
 	return id, replaced
 }
 
+// AttachFilteredHandler attaches a handler that will only be called when events are published to specific topics
+func (b *Bus) AttachFilteredHandler(id string, fn EventHandler, topics ...string) (string, bool) {
+	if len(topics) == 0 {
+		return b.AttachHandler(id, fn)
+	}
+	return b.AttachHandler(id, eventFilterFunc(topics, fn))
+}
+
 // AttachChannel immediately adds the provided channel to the list of recipients for new
 // events.
 //
@@ -255,9 +263,16 @@ func (b *Bus) AttachChannel(id string, ch EventChannel) (string, bool) {
 	if ch == nil {
 		panic(fmt.Sprintf("AttachChannel called with id %q and nil channel", id))
 	}
-	return b.AttachHandler(id, func(n Event) {
-		ch <- n
-	})
+	return b.AttachHandler(id, eventChanFunc(ch))
+}
+
+// AttachFilteredChannel attaches a channel will only have events pushed to it when they are published to specific
+// topics
+func (b *Bus) AttachFilteredChannel(id string, ch EventChannel, topics ...string) (string, bool) {
+	if len(topics) == 0 {
+		return b.AttachChannel(id, ch)
+	}
+	return b.AttachHandler(id, eventFilterChanFunc(topics, ch))
 }
 
 // DetachRecipient immediately removes the provided recipient from receiving any new events,
@@ -346,5 +361,52 @@ func (b *Bus) doRequest(ctx context.Context, to, topic string, data interface{})
 		return resp, nil
 	case <-ctx.Done():
 		return Reply{}, ctx.Err()
+	}
+}
+
+func eventChanFunc(ch EventChannel) EventHandler {
+	return func(event Event) {
+		ch <- event
+	}
+}
+
+func eventFilterFunc(topics []string, fn EventHandler) EventHandler {
+	// fastpath when only single topic is being filtered
+	if len(topics) == 1 {
+		topic := topics[0]
+		return func(event Event) {
+			if topic == event.Topic {
+				fn(event)
+			}
+		}
+	}
+	return func(event Event) {
+		for _, topic := range topics {
+			if topic == event.Topic {
+				fn(event)
+				return
+			}
+		}
+	}
+}
+
+func eventFilterChanFunc(topics []string, ch EventChannel) EventHandler {
+	// fastpath when only single topic is being filtered
+	if len(topics) == 1 {
+		topic := topics[0]
+		return func(event Event) {
+			if topic == event.Topic {
+				ch <- event
+				return
+			}
+		}
+	}
+	return func(event Event) {
+		for _, topic := range topics {
+			if topic == event.Topic {
+				ch <- event
+				return
+			}
+		}
 	}
 }
