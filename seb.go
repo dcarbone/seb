@@ -272,7 +272,7 @@ func (b *Bus) AttachFilteredChannel(id string, ch EventChannel, topics ...string
 	if len(topics) == 0 {
 		return b.AttachChannel(id, ch)
 	}
-	return b.AttachHandler(id, eventFilterChanFunc(topics, ch))
+	return b.AttachHandler(id, eventChanFilterFunc(topics, ch))
 }
 
 // DetachRecipient immediately removes the provided recipient from receiving any new events,
@@ -390,14 +390,13 @@ func eventFilterFunc(topics []string, fn EventHandler) EventHandler {
 	}
 }
 
-func eventFilterChanFunc(topics []string, ch EventChannel) EventHandler {
+func eventChanFilterFunc(topics []string, ch EventChannel) EventHandler {
 	// fastpath when only single topic is being filtered
 	if len(topics) == 1 {
 		topic := topics[0]
 		return func(event Event) {
 			if topic == event.Topic {
 				ch <- event
-				return
 			}
 		}
 	}
