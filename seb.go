@@ -5,7 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
-	"slices"
+	"regexp"
 	"strconv"
 	"sync"
 	"time"
@@ -236,8 +236,10 @@ func (b *Bus) AttachHandler(id string, fn EventHandler) (string, bool) {
 	return id, replaced
 }
 
-// AttachFilteredHandler attaches a handler that will only be called when events are published to specific topics
-func (b *Bus) AttachFilteredHandler(id string, fn EventHandler, topics ...string) (string, bool) {
+// AttachFilteredHandler attaches a handler that will only be called when events are published to specific topics.
+// You may provide either a string to be used as an exact match, or an instance of *regexp.Regexp to use for
+// fuzzy matching.  Exact string matches are tested first, followed by fuzzy matches.
+func (b *Bus) AttachFilteredHandler(id string, fn EventHandler, topics ...any) (string, bool) {
 	if len(topics) == 0 {
 		return b.AttachHandler(id, fn)
 	}
@@ -259,16 +261,17 @@ func (b *Bus) AttachChannel(id string, ch EventChannel) (string, bool) {
 }
 
 // AttachFilteredChannel attaches a channel will only have events pushed to it when they are published to specific
-// topics
-func (b *Bus) AttachFilteredChannel(id string, ch EventChannel, topics ...string) (string, bool) {
+// topics.  You may provide either a string to be used as an exact match, or an instance of *regexp.Regexp to use for
+// fuzzy matching.  Exact string matches are tested first, followed by fuzzy matches.
+func (b *Bus) AttachFilteredChannel(id string, ch EventChannel, topics ...any) (string, bool) {
 	if len(topics) == 0 {
 		return b.AttachChannel(id, ch)
 	}
 	return b.AttachHandler(id, eventChanFilterFunc(topics, ch))
 }
 
-// DetachRecipient immediately removes the provided recipient from receiving any new events,
-// returning true if a recipient was found with the provided id
+// DetachRecipient immediately removes the provided recipient from receiving any new events, returning true if a
+// recipient was found with the provided id
 func (b *Bus) DetachRecipient(id string) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -377,22 +380,19 @@ func eventChanFunc(ch EventChannel) EventHandler {
 	}
 }
 
-func eventFilterFunc(topics []string, fn EventHandler) EventHandler {
-	// fastpath when only single topic is being filtered
-	if len(topics) == 1 {
-		topic := topics[0]
+func eventStringFilterFunc(st []string, fn EventHandler) EventHandler {
+	if len(st) == 1 {
+		st0 := st[0]
 		return func(event Event) {
-			if topic == event.Topic {
+			if st0 == event.Topic {
 				fn(event)
 			}
 		}
 	}
 
-	// create local copy of topics
-	tps := slices.Clone(topics)
 	return func(event Event) {
-		for i := range tps {
-			if tps[i] == event.Topic {
+		for i := range st {
+			if st[i] == event.Topic {
 				fn(event)
 				return
 			}
@@ -400,25 +400,156 @@ func eventFilterFunc(topics []string, fn EventHandler) EventHandler {
 	}
 }
 
-func eventChanFilterFunc(topics []string, ch EventChannel) EventHandler {
-	// fastpath when only single topic is being filtered
-	if len(topics) == 1 {
-		topic := topics[0]
+func eventRegexpFilterFunc(rt []*regexp.Regexp, fn EventHandler) EventHandler {
+	if len(rt) == 0 {
+		rt0 := rt[0]
 		return func(event Event) {
-			if topic == event.Topic {
+			if rt0.MatchString(event.Topic) {
+				fn(event)
+			}
+		}
+	}
+
+	return func(event Event) {
+		for i := range rt {
+			if rt[i].MatchString(event.Topic) {
+				fn(event)
+				return
+			}
+		}
+	}
+}
+
+func eventCombinedFilterFunc(st []string, rt []*regexp.Regexp, fn EventHandler) EventHandler {
+	return func(event Event) {
+		for i := range st {
+			if st[i] == event.Topic {
+				fn(event)
+				return
+			}
+		}
+		for i := range rt {
+			if rt[i].MatchString(event.Topic) {
+				fn(event)
+				return
+			}
+		}
+	}
+}
+
+func eventFilterFunc(topics []any, fn EventHandler) EventHandler {
+	var (
+		stl int
+		st  []string
+		rtl int
+		rt  []*regexp.Regexp
+	)
+	for i := range topics {
+		if s, ok := topics[i].(string); ok {
+			st = append(st, s)
+			stl++
+		} else if r, ok := topics[i].(*regexp.Regexp); ok {
+			rt = append(rt, r)
+			rtl++
+		} else {
+			panic(fmt.Sprintf("cannot handle filter of type %T, expected %T or %T", topics[i], "", (*regexp.Regexp)(nil)))
+		}
+	}
+
+	if stl > 0 && rtl > 0 {
+		return eventCombinedFilterFunc(st, rt, fn)
+	} else if stl > 0 {
+		return eventStringFilterFunc(st, fn)
+	} else if rtl > 0 {
+		return eventRegexpFilterFunc(rt, fn)
+	} else {
+		return func(_ Event) {}
+	}
+}
+
+func eventChanStringFilterFunc(st []string, ch EventChannel) EventHandler {
+	if len(st) == 1 {
+		st0 := st[0]
+		return func(event Event) {
+			if st0 == event.Topic {
 				ch <- event
 			}
 		}
 	}
 
-	// create local copy of topics
-	tps := slices.Clone(topics)
 	return func(event Event) {
-		for i := range tps {
-			if tps[i] == event.Topic {
+		for i := range st {
+			if st[i] == event.Topic {
 				ch <- event
 				return
 			}
 		}
+	}
+}
+
+func eventChanRegexpFilterFunc(rt []*regexp.Regexp, ch EventChannel) EventHandler {
+	if len(rt) == 0 {
+		rt0 := rt[0]
+		return func(event Event) {
+			if rt0.MatchString(event.Topic) {
+				ch <- event
+			}
+		}
+	}
+
+	return func(event Event) {
+		for i := range rt {
+			if rt[i].MatchString(event.Topic) {
+				ch <- event
+				return
+			}
+		}
+	}
+}
+
+func eventChanCombinedFilterFunc(st []string, rt []*regexp.Regexp, ch EventChannel) EventHandler {
+	return func(event Event) {
+		for i := range st {
+			if st[i] == event.Topic {
+				ch <- event
+				return
+			}
+		}
+		for i := range rt {
+			if rt[i].MatchString(event.Topic) {
+				ch <- event
+				return
+			}
+		}
+	}
+}
+
+func eventChanFilterFunc(topics []any, ch EventChannel) EventHandler {
+	var (
+		stl int
+		st  []string
+		rtl int
+		rt  []*regexp.Regexp
+	)
+	for i := range topics {
+		if s, ok := topics[i].(string); ok {
+			st = append(st, s)
+			stl++
+		} else if r, ok := topics[i].(*regexp.Regexp); ok {
+			rt = append(rt, r)
+			rtl++
+		} else {
+			panic(fmt.Sprintf("cannot handle filter of type %T, expected %T or %T", topics[i], "", (*regexp.Regexp)(nil)))
+		}
+	}
+
+	if stl > 0 && rtl > 0 {
+		return eventChanCombinedFilterFunc(st, rt, ch)
+	} else if stl > 0 {
+		return eventChanStringFilterFunc(st, ch)
+	} else if rtl > 0 {
+		return eventChanRegexpFilterFunc(rt, ch)
+	} else {
+		return func(_ Event) {}
 	}
 }
