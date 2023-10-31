@@ -98,26 +98,24 @@ func (w *worker) publish() {
 		w.mu.Lock()
 
 		// test if worker was closed between message push request and now.
-		if w.closed {
-			w.mu.Unlock()
-			return
-		}
-
-		// either construct timer or reset existing
-		if wait == nil {
-			wait = time.NewTimer(5 * time.Second)
-		} else {
-			wait.Reset(5 * time.Second)
-		}
-
-		// attempt to push message to consumer, allowing for up to 5 seconds of blocking
-		// if block window passes, drop on floor
-		select {
-		case w.out <- n:
-			if !wait.Stop() {
-				<-wait.C
+		if !w.closed {
+			// either construct timer or reset existing
+			if wait == nil {
+				wait = time.NewTimer(5 * time.Second)
+			} else {
+				wait.Reset(5 * time.Second)
 			}
-		case <-wait.C:
+
+			// attempt to push message to consumer, allowing for up to 5 seconds of blocking
+			// if block window passes, drop on floor
+			select {
+			case w.out <- n:
+				if !wait.Stop() {
+					<-wait.C
+				}
+			case <-wait.C:
+			}
+
 		}
 
 		w.mu.Unlock()
@@ -170,16 +168,18 @@ func (s *lockableRandSource) Int63() int64 {
 }
 
 type Bus struct {
-	mu     sync.RWMutex
-	rand   *lockableRandSource
-	topics map[string]*worker
+	mu   sync.Mutex
+	rand *lockableRandSource
+
+	// workers is a map of recipient_id => worker
+	workers map[string]*worker
 }
 
 // New creates a new Bus for immediate use
 func New() *Bus {
 	b := Bus{
-		topics: make(map[string]*worker),
-		rand:   newLockableRandSource(),
+		workers: make(map[string]*worker),
+		rand:    newLockableRandSource(),
 	}
 	return &b
 }
@@ -227,16 +227,16 @@ func (b *Bus) AttachHandler(id string, fn EventHandler) (string, bool) {
 		id = strconv.FormatInt(b.rand.Int63(), 10)
 	}
 
-	if w, replaced = b.topics[id]; replaced {
+	if w, replaced = b.workers[id]; replaced {
 		w.close()
 	}
 
-	b.topics[id] = newWorker(id, fn)
+	b.workers[id] = newWorker(id, fn)
 
 	return id, replaced
 }
 
-// AttachFilteredHandler attaches a handler that will only be called when events are published to specific topics.
+// AttachFilteredHandler attaches a handler that will only be called when events are published to specific workers.
 // You may provide either a string to be used as an exact match, or an instance of *regexp.Regexp to use for
 // fuzzy matching.  Exact string matches are tested first, followed by fuzzy matches.
 func (b *Bus) AttachFilteredHandler(id string, fn EventHandler, topics ...any) (string, bool) {
@@ -261,7 +261,7 @@ func (b *Bus) AttachChannel(id string, ch EventChannel) (string, bool) {
 }
 
 // AttachFilteredChannel attaches a channel will only have events pushed to it when they are published to specific
-// topics.  You may provide either a string to be used as an exact match, or an instance of *regexp.Regexp to use for
+// workers.  You may provide either a string to be used as an exact match, or an instance of *regexp.Regexp to use for
 // fuzzy matching.  Exact string matches are tested first, followed by fuzzy matches.
 func (b *Bus) AttachFilteredChannel(id string, ch EventChannel, topics ...any) (string, bool) {
 	if len(topics) == 0 {
@@ -276,9 +276,9 @@ func (b *Bus) DetachRecipient(id string) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	if w, ok := b.topics[id]; ok {
+	if w, ok := b.workers[id]; ok {
 		go w.close()
-		delete(b.topics, id)
+		delete(b.workers, id)
 		return ok
 	}
 
@@ -292,14 +292,14 @@ func (b *Bus) DetachAllRecipients() int {
 	defer b.mu.Unlock()
 
 	// count how many are in there right now
-	cnt := len(b.topics)
+	cnt := len(b.workers)
 
 	// close all current in separate goroutine
-	for _, w := range b.topics {
+	for _, w := range b.workers {
 		go w.close()
 	}
 
-	b.topics = make(map[string]*worker)
+	b.workers = make(map[string]*worker)
 
 	return cnt
 }
@@ -316,20 +316,33 @@ func (b *Bus) buildEvent(t string, d any) Event {
 
 // sendEvent immediately calls each handler with the new event
 func (b *Bus) sendEvent(ev Event) error {
-	b.mu.RLock()
+	b.mu.Lock()
 
 	var (
-		err      error
 		finalErr []error
+
+		wg    = new(sync.WaitGroup)
+		errCh = make(chan error, len(b.workers)+1)
 	)
 
-	for i := range b.topics {
-		if err = b.topics[i].push(ev); err != nil {
-			finalErr = append(finalErr, fmt.Errorf("worker %q produced error on push: %w", b.topics[i].id, err))
-		}
+	for topic := range b.workers {
+		wg.Add(1)
+		go func(w *worker) { errCh <- w.push(ev) }(b.workers[topic])
 	}
 
-	b.mu.RUnlock()
+	b.mu.Unlock()
+
+	go func() {
+		wg.Wait()
+		close(errCh)
+	}()
+
+	for err := range errCh {
+		wg.Done()
+		if err != nil {
+			finalErr = append(finalErr, err)
+		}
+	}
 
 	if len(finalErr) > 0 {
 		return errors.Join(finalErr...)
@@ -339,11 +352,20 @@ func (b *Bus) sendEvent(ev Event) error {
 }
 
 func (b *Bus) sendEventTo(to string, ev Event) error {
-	b.mu.RLock()
-	defer b.mu.RUnlock()
-	if w, ok := b.topics[to]; ok {
-		return w.push(ev)
+	b.mu.Lock()
+	if w, ok := b.workers[to]; ok {
+		b.mu.Unlock()
+
+		errCh := make(chan error, 1)
+		defer close(errCh)
+
+		go func() { errCh <- w.push(ev) }()
+
+		return <-errCh
 	}
+
+	b.mu.Unlock()
+
 	return fmt.Errorf("%w: %s", ErrRecipientNotFound, to)
 }
 
