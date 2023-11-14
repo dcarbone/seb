@@ -236,14 +236,14 @@ func (b *Bus) AttachHandler(id string, fn EventHandler) (string, bool) {
 	return id, replaced
 }
 
-// AttachFilteredHandler attaches a handler that will only be called when events are published to specific workers.
+// AttachFilteredHandler attaches a handler that will only be called when events are published to specific topics.
 // You may provide either a string to be used as an exact match, or an instance of *regexp.Regexp to use for
 // fuzzy matching.  Exact string matches are tested first, followed by fuzzy matches.
-func (b *Bus) AttachFilteredHandler(id string, fn EventHandler, topics ...any) (string, bool) {
-	if len(topics) == 0 {
+func (b *Bus) AttachFilteredHandler(id string, fn EventHandler, topicFilters ...any) (string, bool) {
+	if len(topicFilters) == 0 {
 		return b.AttachHandler(id, fn)
 	}
-	return b.AttachHandler(id, eventFilterFunc(topics, fn))
+	return b.AttachHandler(id, eventFilterFunc(topicFilters, fn))
 }
 
 // AttachChannel immediately adds the provided channel to the list of recipients for new
@@ -257,17 +257,17 @@ func (b *Bus) AttachChannel(id string, ch EventChannel) (string, bool) {
 	if ch == nil {
 		panic(fmt.Sprintf("AttachChannel called with id %q and nil channel", id))
 	}
-	return b.AttachHandler(id, eventChanFunc(ch))
+	return b.AttachHandler(id, func(event Event) { ch <- event })
 }
 
 // AttachFilteredChannel attaches a channel will only have events pushed to it when they are published to specific
-// workers.  You may provide either a string to be used as an exact match, or an instance of *regexp.Regexp to use for
+// topics.  You may provide either a string to be used as an exact match, or an instance of *regexp.Regexp to use for
 // fuzzy matching.  Exact string matches are tested first, followed by fuzzy matches.
-func (b *Bus) AttachFilteredChannel(id string, ch EventChannel, topics ...any) (string, bool) {
-	if len(topics) == 0 {
+func (b *Bus) AttachFilteredChannel(id string, ch EventChannel, topicFilters ...any) (string, bool) {
+	if len(topicFilters) == 0 {
 		return b.AttachChannel(id, ch)
 	}
-	return b.AttachHandler(id, eventChanFilterFunc(topics, ch))
+	return b.AttachHandler(id, eventChanFilterFunc(topicFilters, ch))
 }
 
 // DetachRecipient immediately removes the provided recipient from receiving any new events, returning true if a
@@ -396,182 +396,64 @@ func (b *Bus) doRequest(ctx context.Context, to, topic string, data any) (Reply,
 	}
 }
 
-func eventChanFunc(ch EventChannel) EventHandler {
-	return func(event Event) {
-		ch <- event
-	}
-}
-
-func eventStringFilterFunc(st []string, fn EventHandler) EventHandler {
-	if len(st) == 1 {
-		st0 := st[0]
-		return func(event Event) {
-			if st0 == event.Topic {
-				fn(event)
-			}
-		}
-	}
-
-	return func(event Event) {
-		for i := range st {
-			if st[i] == event.Topic {
-				fn(event)
-				return
-			}
-		}
-	}
-}
-
-func eventRegexpFilterFunc(rt []*regexp.Regexp, fn EventHandler) EventHandler {
-	if len(rt) == 0 {
-		rt0 := rt[0]
-		return func(event Event) {
-			if rt0.MatchString(event.Topic) {
-				fn(event)
-			}
-		}
-	}
-
-	return func(event Event) {
-		for i := range rt {
-			if rt[i].MatchString(event.Topic) {
-				fn(event)
-				return
-			}
-		}
-	}
-}
-
-func eventCombinedFilterFunc(st []string, rt []*regexp.Regexp, fn EventHandler) EventHandler {
-	return func(event Event) {
-		for i := range st {
-			if st[i] == event.Topic {
-				fn(event)
-				return
-			}
-		}
-		for i := range rt {
-			if rt[i].MatchString(event.Topic) {
-				fn(event)
-				return
-			}
-		}
-	}
-}
-
 func eventFilterFunc(topics []any, fn EventHandler) EventHandler {
 	var (
-		stl int
-		st  []string
-		rtl int
-		rt  []*regexp.Regexp
+		st []string
+		rt []*regexp.Regexp
 	)
 	for i := range topics {
 		if s, ok := topics[i].(string); ok {
 			st = append(st, s)
-			stl++
 		} else if r, ok := topics[i].(*regexp.Regexp); ok {
 			rt = append(rt, r)
-			rtl++
 		} else {
 			panic(fmt.Sprintf("cannot handle filter of type %T, expected %T or %T", topics[i], "", (*regexp.Regexp)(nil)))
 		}
 	}
 
-	if stl > 0 && rtl > 0 {
-		return eventCombinedFilterFunc(st, rt, fn)
-	} else if stl > 0 {
-		return eventStringFilterFunc(st, fn)
-	} else if rtl > 0 {
-		return eventRegexpFilterFunc(rt, fn)
-	} else {
-		return func(_ Event) {}
-	}
-}
-
-func eventChanStringFilterFunc(st []string, ch EventChannel) EventHandler {
-	if len(st) == 1 {
-		st0 := st[0]
-		return func(event Event) {
-			if st0 == event.Topic {
-				ch <- event
-			}
-		}
-	}
-
 	return func(event Event) {
 		for i := range st {
 			if st[i] == event.Topic {
-				ch <- event
-				return
-			}
-		}
-	}
-}
-
-func eventChanRegexpFilterFunc(rt []*regexp.Regexp, ch EventChannel) EventHandler {
-	if len(rt) == 0 {
-		rt0 := rt[0]
-		return func(event Event) {
-			if rt0.MatchString(event.Topic) {
-				ch <- event
-			}
-		}
-	}
-
-	return func(event Event) {
-		for i := range rt {
-			if rt[i].MatchString(event.Topic) {
-				ch <- event
-				return
-			}
-		}
-	}
-}
-
-func eventChanCombinedFilterFunc(st []string, rt []*regexp.Regexp, ch EventChannel) EventHandler {
-	return func(event Event) {
-		for i := range st {
-			if st[i] == event.Topic {
-				ch <- event
+				fn(event)
 				return
 			}
 		}
 		for i := range rt {
 			if rt[i].MatchString(event.Topic) {
-				ch <- event
+				fn(event)
 				return
 			}
 		}
 	}
 }
 
-func eventChanFilterFunc(topics []any, ch EventChannel) EventHandler {
+func eventChanFilterFunc(topicFilters []any, ch EventChannel) EventHandler {
 	var (
-		stl int
-		st  []string
-		rtl int
-		rt  []*regexp.Regexp
+		st []string
+		rt []*regexp.Regexp
 	)
-	for i := range topics {
-		if s, ok := topics[i].(string); ok {
+	for i := range topicFilters {
+		if s, ok := topicFilters[i].(string); ok {
 			st = append(st, s)
-			stl++
-		} else if r, ok := topics[i].(*regexp.Regexp); ok {
+		} else if r, ok := topicFilters[i].(*regexp.Regexp); ok {
 			rt = append(rt, r)
-			rtl++
 		} else {
-			panic(fmt.Sprintf("cannot handle filter of type %T, expected %T or %T", topics[i], "", (*regexp.Regexp)(nil)))
+			panic(fmt.Sprintf("cannot handle filter of type %T, expected %T or %T", topicFilters[i], "", (*regexp.Regexp)(nil)))
 		}
 	}
 
-	if stl > 0 && rtl > 0 {
-		return eventChanCombinedFilterFunc(st, rt, ch)
-	} else if stl > 0 {
-		return eventChanStringFilterFunc(st, ch)
-	} else if rtl > 0 {
-		return eventChanRegexpFilterFunc(rt, ch)
-	} else {
-		return func(_ Event) {}
+	return func(event Event) {
+		for i := range st {
+			if st[i] == event.Topic {
+				ch <- event
+				return
+			}
+		}
+		for i := range rt {
+			if rt[i].MatchString(event.Topic) {
+				ch <- event
+				return
+			}
+		}
 	}
 }
