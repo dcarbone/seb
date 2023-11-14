@@ -110,7 +110,7 @@ func (w *worker) publish() {
 			// if block window passes, drop on floor
 			select {
 			case w.out <- n:
-				if !wait.Stop() {
+				if !wait.Stop() && len(wait.C) > 0 {
 					<-wait.C
 				}
 			case <-wait.C:
