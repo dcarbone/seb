@@ -137,7 +137,7 @@ func (w *worker) push(n Event) error {
 	defer w.mu.Unlock()
 
 	if w.closed {
-		return ErrWorkerClosed
+		return fmt.Errorf("cannot publish event to topic %q, %w", n.Topic, ErrWorkerClosed)
 	}
 
 	// attempt to push message to ingest chan.  if chan is full, drop on floor
@@ -145,7 +145,7 @@ func (w *worker) push(n Event) error {
 	case w.in <- n:
 		return nil
 	default:
-		return ErrWorkerBufferFull
+		return fmt.Errorf("cannot publish event to topic %q, %w", n.Topic, ErrWorkerBufferFull)
 	}
 }
 
