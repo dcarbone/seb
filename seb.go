@@ -316,14 +316,14 @@ func (b *Bus) buildEvent(t string, d any) Event {
 
 // sendEvent immediately calls each handler with the new event
 func (b *Bus) sendEvent(ev Event) error {
-	b.mu.Lock()
-
 	var (
 		finalErr []error
 
 		wg    = new(sync.WaitGroup)
 		errCh = make(chan error, len(b.workers)+1)
 	)
+
+	b.mu.Lock()
 
 	for topic := range b.workers {
 		wg.Add(1)
