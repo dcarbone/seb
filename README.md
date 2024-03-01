@@ -1,6 +1,73 @@
 # seb
 Simple event bus written in go
 
+# Installation
+
+```shell
+go get -u github.com/dcarbone/seb/v3
+```
+
+# Global Bus Usage
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/dcarbone/seb/v3"
+)
+
+func eventHandler(ev seb.Event) {
+	fmt.Println("Event received:", ev)
+}
+
+func main() {
+	seb.AttachFunc("", eventHandler)
+
+	err := seb.Push(context.Background(), "topic-1", map[string]string{"hello": "dave"})
+	if err != nil {
+		panic(err.Error())
+    }
+	
+	// and so on.
+}
+
+```
+
+# Custom Bus
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/dcarbone/seb/v3"
+)
+
+func eventHandler(ev seb.Event) {
+	fmt.Println("Event received:", ev)
+}
+
+func main() {
+	bus := seb.New(
+		// apply bus options here...
+	)
+	
+	bus.AttachFunc("", eventHandler)
+
+	err := bus.Push(context.Background(), "topic-1", map[string]string{"hello": "dave"})
+	if err != nil {
+		panic(err.Error())
+    }
+	
+	// and so on.
+}
+```
+
 ## Primary Goals
 
 ### Accept callback funcs or channels

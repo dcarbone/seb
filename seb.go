@@ -11,17 +11,62 @@ import (
 	"time"
 )
 
-var GlobalBus *Bus
+const (
+	DefaultRecipientBufferSize = 100
+	DefaultBlockedEventTTL     = 5 * time.Second
+)
 
-func init() {
-	GlobalBus = New()
+var (
+	globalBusMu sync.Mutex
+	globalBus   *Bus
+)
+
+// GlobalBus returns a bus that is global to this package, allowing its use as a static singleton.
+// If you need event isolation or different configuration, you will need to construct a new Bus.
+func GlobalBus() *Bus {
+	globalBusMu.Lock()
+	defer globalBusMu.Unlock()
+	if globalBus == nil {
+		globalBus = New()
+	}
+	return globalBus
+}
+
+// AttachFunc attaches an event recipient func to the global bus
+func AttachFunc(id string, fn EventFunc, topicFilters ...any) (string, bool) {
+	return GlobalBus().AttachFunc(id, fn, topicFilters...)
+}
+
+// AttachChannel attaches an event recipient channel to the global bus
+func AttachChannel(id string, ch EventChannel, topicFilters ...any) (string, bool) {
+	return GlobalBus().AttachChannel(id, ch, topicFilters...)
+}
+
+// Push pushes an event onto the global bus
+func Push(ctx context.Context, topic string, data any) error {
+	return GlobalBus().Push(ctx, topic, data)
+}
+
+// PushTo attempts to push an event to a particular recipient
+func PushTo(ctx context.Context, to, topic string, data any) error {
+	return GlobalBus().PushTo(ctx, to, topic, data)
+}
+
+// Request pushes an event with the Reply field populated, indicating the pusher expects a response
+func Request(ctx context.Context, topic string, data any) (Reply, error) {
+	return GlobalBus().Request(ctx, topic, data)
+}
+
+// RequestFrom attempts to push a request event to a particular recipient
+func RequestFrom(ctx context.Context, to, topic string, data any) (Reply, error) {
+	return GlobalBus().RequestFrom(ctx, to, topic, data)
 }
 
 var (
 	ErrRecipientNotFound = errors.New("target recipient not found")
 
-	ErrWorkerClosed     = errors.New("worker is closed")
-	ErrWorkerBufferFull = errors.New("worker input buffer is full")
+	ErrRecipientClosed     = errors.New("recipient is closed")
+	ErrRecipientBufferFull = errors.New("recipient event buffer is full")
 )
 
 type Reply struct {
@@ -32,122 +77,30 @@ type Reply struct {
 // Event describes a specific event with associated data that gets pushed to any registered recipients at the
 // time of push
 type Event struct {
-	ID         string       // random
-	Originated int64        // unixnano timestamp of when this event was created
-	Topic      string       // topic of event
-	Data       any          // no attempt is made to prevent memory sharing
-	Reply      chan<- Reply // if defined, hints to recipients that a response is desired.
+	// Ctx is the context that was provided at time of event push
+	Ctx context.Context
+
+	// ID is the randomly generated ID of this event
+	ID int64
+
+	// Originated is the unix nano timestamp of when this event was created
+	Originated int64
+
+	// Topic is the topic this event was pushed to
+	Topic string
+
+	// Data is arbitrary data accompanying this event
+	Data any
+
+	// Reply is used to send a message back to the pusher of this event.  If this field is nil, no reply is expected.
+	Reply chan<- Reply // if defined, hints to recipients that a response is desired.
 }
 
-// EventHandler can be provided to a Bus to be called per Event
-type EventHandler func(Event)
+// EventFunc can be provided to a Bus to be called per Event
+type EventFunc func(Event)
 
 // EventChannel can be provided to a Bus to have new Events pushed to it
 type EventChannel chan Event
-
-type worker struct {
-	mu     sync.Mutex
-	id     string
-	closed bool
-	in     chan Event
-	out    chan Event
-	fn     EventHandler
-}
-
-func newWorker(id string, fn EventHandler) *worker {
-	w := &worker{
-		id:  id,
-		in:  make(chan Event, 100),
-		out: make(chan Event),
-		fn:  fn,
-	}
-	go w.publish()
-	go w.process()
-	return w
-}
-
-func (w *worker) close() {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-
-	if w.closed {
-		return
-	}
-
-	w.closed = true
-
-	close(w.in)
-	close(w.out)
-	if len(w.in) > 0 {
-		for range w.in {
-		}
-	}
-}
-
-func (w *worker) publish() {
-	var wait *time.Timer
-
-	defer func() {
-		if wait != nil && !wait.Stop() && len(wait.C) > 0 {
-			<-wait.C
-		}
-	}()
-
-	for n := range w.in {
-		// acquire lock to prevent closure while attempting to push a message
-		w.mu.Lock()
-
-		// test if worker was closed between message push request and now.
-		if !w.closed {
-			// either construct timer or reset existing
-			if wait == nil {
-				wait = time.NewTimer(5 * time.Second)
-			} else {
-				wait.Reset(5 * time.Second)
-			}
-
-			// attempt to push message to consumer, allowing for up to 5 seconds of blocking
-			// if block window passes, drop on floor
-			select {
-			case w.out <- n:
-				if !wait.Stop() && len(wait.C) > 0 {
-					<-wait.C
-				}
-			case <-wait.C:
-			}
-
-		}
-
-		w.mu.Unlock()
-	}
-}
-
-func (w *worker) process() {
-	// w.out is an unbuffered channel.  it blocks until any preceding event has been handled by the registered
-	// handler.  it is closed once the publish() loop breaks.
-	for n := range w.out {
-		w.fn(n)
-	}
-}
-
-func (w *worker) push(n Event) error {
-	// hold a lock for the duration of the push attempt to ensure that, at a minimum, the message is added to the
-	// channel before it can be closed.
-	w.mu.Lock()
-	defer w.mu.Unlock()
-
-	if w.closed {
-		return fmt.Errorf("cannot publish event to topic %q, %w", n.Topic, ErrWorkerClosed)
-	}
-
-	// attempt to push message to ingest chan.  if chan is full, drop on floor
-	select {
-	case w.in <- n:
-		return nil
-	default:
-		return fmt.Errorf("cannot publish event to topic %q, %w", n.Topic, ErrWorkerBufferFull)
-	}
-}
 
 type lockableRandSource struct {
 	mu  sync.Mutex
@@ -167,34 +120,199 @@ func (s *lockableRandSource) Int63() int64 {
 	return v
 }
 
+type recipientConfig struct {
+	buffSize int
+	blockTTL time.Duration
+}
+
+type recipient struct {
+	mu       sync.Mutex
+	id       string
+	closed   bool
+	blockTTL time.Duration
+	in       chan Event
+	out      chan Event
+	fn       EventFunc
+}
+
+func newRecipient(id string, fn EventFunc, cfg recipientConfig) *recipient {
+	w := &recipient{
+		id:       id,
+		blockTTL: cfg.blockTTL,
+		in:       make(chan Event, cfg.buffSize),
+		out:      make(chan Event),
+		fn:       fn,
+	}
+	go w.send()
+	go w.process()
+	return w
+}
+
+func (r *recipient) close() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.closed {
+		return
+	}
+
+	r.closed = true
+
+	close(r.in)
+	close(r.out)
+	if len(r.in) > 0 {
+		for range r.in {
+		}
+	}
+}
+
+func (r *recipient) send() {
+	var wait *time.Timer
+
+	defer func() {
+		if wait != nil && !wait.Stop() && len(wait.C) > 0 {
+			<-wait.C
+		}
+	}()
+
+	for ev := range r.in {
+		// acquire lock to prevent closure while attempting to push a message
+		r.mu.Lock()
+
+		// test if recipient was closed between message push request and now.
+		if r.closed {
+			r.mu.Unlock()
+			continue
+		}
+
+		// if the block ttl is > 0...
+		if r.blockTTL > 0 {
+
+			// construct or reset block ttl timer
+			if wait == nil {
+				wait = time.NewTimer(r.blockTTL)
+			} else {
+				if !wait.Stop() && len(wait.C) > 0 {
+					<-wait.C
+				}
+				wait.Reset(r.blockTTL)
+			}
+
+			// attempt to send message.  if recipient blocks for more than configured
+			select {
+			case r.out <- ev:
+			case <-ev.Ctx.Done():
+			case <-wait.C:
+			}
+		} else {
+			// attempt to push event to recipient
+			select {
+			case r.out <- ev:
+			case <-ev.Ctx.Done():
+			}
+		}
+
+		r.mu.Unlock()
+	}
+}
+
+func (r *recipient) process() {
+	// r.out is an unbuffered channel.  it blocks until any preceding event has been handled by the registered
+	// handler.  it is closed once the push() loop breaks.
+	for n := range r.out {
+		r.fn(n)
+	}
+}
+
+func (r *recipient) push(ev Event) error {
+	// hold a lock for the duration of the push attempt to ensure that, at a minimum, the message is added to the
+	// channel before it can be closed.
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.closed {
+		return fmt.Errorf("%w: %q", ErrRecipientClosed, r.id)
+	}
+
+	// attempt to push message to ingest chan.  if chan is full or event context expires, drop on floor
+	select {
+	case <-ev.Ctx.Done():
+		return fmt.Errorf("cannot push topic %q event %d to recipient %q: %w", ev.Topic, ev.ID, r.id, ev.Ctx.Err())
+	case r.in <- ev:
+		return nil
+	default:
+		return fmt.Errorf("cannot push topic %q event %d to recipient %q: %w", ev.Topic, ev.ID, r.id, ErrRecipientBufferFull)
+	}
+}
+
+type BusConfig struct {
+	// BlockedEventTTL denotes the maximum amount of time a given recipient will be allowed to block before
+	// an event before the event is dropped for that recipient.  This only impacts the event for the blocking recipient
+	BlockedEventTTL time.Duration
+
+	// RecipientBufferSize will be the size of the input buffer created for your recipient.
+	RecipientBufferSize int
+}
+
+type BusOpt func(*BusConfig)
+
+func WithBlockedEventTTL(d time.Duration) BusOpt {
+	return func(cfg *BusConfig) {
+		cfg.BlockedEventTTL = d
+	}
+}
+
+func WithRecipientBufferSize(n int) BusOpt {
+	return func(cfg *BusConfig) {
+		cfg.RecipientBufferSize = n
+	}
+}
+
 type Bus struct {
-	mu   sync.Mutex
+	mu sync.Mutex
+
 	rand *lockableRandSource
 
-	// workers is a map of recipient_id => worker
-	workers map[string]*worker
+	rcfg recipientConfig
+
+	// recipients is a map of recipient_id => recipient
+	recipients map[string]*recipient
 }
 
 // New creates a new Bus for immediate use
-func New() *Bus {
-	b := Bus{
-		workers: make(map[string]*worker),
-		rand:    newLockableRandSource(),
+func New(opts ...BusOpt) *Bus {
+	cfg := BusConfig{
+		BlockedEventTTL:     DefaultBlockedEventTTL,
+		RecipientBufferSize: DefaultRecipientBufferSize,
 	}
+
+	for _, fn := range opts {
+		fn(&cfg)
+	}
+
+	b := Bus{
+		rand: newLockableRandSource(),
+		rcfg: recipientConfig{
+			blockTTL: cfg.BlockedEventTTL,
+			buffSize: cfg.RecipientBufferSize,
+		},
+		recipients: make(map[string]*recipient),
+	}
+
 	return &b
 }
 
 // Push will immediately send a new event to all currently registered recipients
-func (b *Bus) Push(topic string, data any) error {
-	return b.sendEvent(b.buildEvent(topic, data))
+func (b *Bus) Push(ctx context.Context, topic string, data any) error {
+	return b.sendEvent(b.buildEvent(ctx, topic, data))
 }
 
 // PushTo attempts to push an even to a specific recipient
-func (b *Bus) PushTo(to, topic string, data any) error {
-	return b.sendEventTo(to, b.buildEvent(topic, data))
+func (b *Bus) PushTo(ctx context.Context, to, topic string, data any) error {
+	return b.sendEventTo(to, b.buildEvent(ctx, topic, data))
 }
 
-// Request will publish a new event with the Reply chan defined, blocking until a single response has been received
+// Request will push a new event with the Reply chan defined, blocking until a single response has been received
 // or the provided context expires
 func (b *Bus) Request(ctx context.Context, topic string, data any) (Reply, error) {
 	return b.doRequest(ctx, "", topic, data)
@@ -205,18 +323,22 @@ func (b *Bus) RequestFrom(ctx context.Context, to, topic string, data any) (Repl
 	return b.doRequest(ctx, to, topic, data)
 }
 
-// AttachHandler immediately adds the provided fn to the list of recipients for new events.
+// AttachFunc immediately adds the provided fn to the list of recipients for new events.
+//
+// You may optionally provide a list of filters to only allow specific messages to be received by this func.  A filter
+// may be a string of the exact topic you wish to receive events from, or a *regexp.Regexp instance to use when
+// matching.
 //
 // It will:
 // - panic if fn is nil
 // - generate random ID if provided ID is empty
 // - return "true" if there was an existing recipient with the same identifier
-func (b *Bus) AttachHandler(id string, fn EventHandler) (string, bool) {
+func (b *Bus) AttachFunc(id string, fn EventFunc, topicFilters ...any) (string, bool) {
 	if fn == nil {
-		panic(fmt.Sprintf("AttachHandler called with id %q and nil handler", id))
+		panic(fmt.Sprintf("AttachFunc called with id %q and nil handler", id))
 	}
 	var (
-		w        *worker
+		w        *recipient
 		replaced bool
 	)
 
@@ -227,23 +349,17 @@ func (b *Bus) AttachHandler(id string, fn EventHandler) (string, bool) {
 		id = strconv.FormatInt(b.rand.Int63(), 10)
 	}
 
-	if w, replaced = b.workers[id]; replaced {
+	if w, replaced = b.recipients[id]; replaced {
 		w.close()
 	}
 
-	b.workers[id] = newWorker(id, fn)
+	if len(topicFilters) > 0 {
+		fn = eventFilterFunc(topicFilters, fn)
+	}
+
+	b.recipients[id] = newRecipient(id, fn, b.rcfg)
 
 	return id, replaced
-}
-
-// AttachFilteredHandler attaches a handler that will only be called when events are published to specific topics.
-// You may provide either a string to be used as an exact match, or an instance of *regexp.Regexp to use for
-// fuzzy matching.  Exact string matches are tested first, followed by fuzzy matches.
-func (b *Bus) AttachFilteredHandler(id string, fn EventHandler, topicFilters ...any) (string, bool) {
-	if len(topicFilters) == 0 {
-		return b.AttachHandler(id, fn)
-	}
-	return b.AttachHandler(id, eventFilterFunc(topicFilters, fn))
 }
 
 // AttachChannel immediately adds the provided channel to the list of recipients for new
@@ -253,63 +369,60 @@ func (b *Bus) AttachFilteredHandler(id string, fn EventHandler, topicFilters ...
 // - panic if ch is nil
 // - generate random ID if provided ID is empty
 // - return "true" if there was an existing recipient with the same identifier
-func (b *Bus) AttachChannel(id string, ch EventChannel) (string, bool) {
+func (b *Bus) AttachChannel(id string, ch EventChannel, topicFilters ...any) (string, bool) {
 	if ch == nil {
 		panic(fmt.Sprintf("AttachChannel called with id %q and nil channel", id))
 	}
-	return b.AttachHandler(id, func(event Event) { ch <- event })
-}
-
-// AttachFilteredChannel attaches a channel will only have events pushed to it when they are published to specific
-// topics.  You may provide either a string to be used as an exact match, or an instance of *regexp.Regexp to use for
-// fuzzy matching.  Exact string matches are tested first, followed by fuzzy matches.
-func (b *Bus) AttachFilteredChannel(id string, ch EventChannel, topicFilters ...any) (string, bool) {
-	if len(topicFilters) == 0 {
-		return b.AttachChannel(id, ch)
+	var fn EventFunc
+	if len(topicFilters) > 0 {
+		fn = eventChanFilterFunc(topicFilters, ch)
+	} else {
+		fn = func(event Event) { ch <- event }
 	}
-	return b.AttachHandler(id, eventChanFilterFunc(topicFilters, ch))
+	return b.AttachFunc(id, fn)
 }
 
-// DetachRecipient immediately removes the provided recipient from receiving any new events, returning true if a
+// Detach immediately removes the provided recipient from receiving any new events, returning true if a
 // recipient was found with the provided id
-func (b *Bus) DetachRecipient(id string) bool {
+func (b *Bus) Detach(id string) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	if w, ok := b.workers[id]; ok {
+	if w, ok := b.recipients[id]; ok {
 		go w.close()
-		delete(b.workers, id)
+		delete(b.recipients, id)
 		return ok
 	}
 
 	return false
 }
 
-// DetachAllRecipients immediately clears all attached recipients, returning the count of those previously
+// DetachAll immediately clears all attached recipients, returning the count of those previously
 // attached.
-func (b *Bus) DetachAllRecipients() int {
+func (b *Bus) DetachAll() int {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
 	// count how many are in there right now
-	cnt := len(b.workers)
+	cnt := len(b.recipients)
 
 	// close all current in separate goroutine
-	for _, w := range b.workers {
+	for _, w := range b.recipients {
 		go w.close()
 	}
 
-	b.workers = make(map[string]*worker)
+	b.recipients = make(map[string]*recipient)
 
 	return cnt
 }
 
-func (b *Bus) buildEvent(t string, d any) Event {
+func (b *Bus) buildEvent(ctx context.Context, topic string, data any) Event {
 	n := Event{
-		ID:         strconv.FormatInt(b.rand.Int63(), 10),
+		Ctx:        ctx,
+		ID:         b.rand.Int63(),
 		Originated: time.Now().UnixNano(),
-		Topic:      t,
-		Data:       d,
+		Topic:      topic,
+		Data:       data,
 	}
 	return n
 }
@@ -317,17 +430,18 @@ func (b *Bus) buildEvent(t string, d any) Event {
 // sendEvent immediately calls each handler with the new event
 func (b *Bus) sendEvent(ev Event) error {
 	var (
-		finalErr []error
-
-		wg    = new(sync.WaitGroup)
-		errCh = make(chan error, len(b.workers)+1)
+		wg    sync.WaitGroup
+		errCh chan error
+		errs  []error
 	)
 
 	b.mu.Lock()
 
-	for topic := range b.workers {
+	errCh = make(chan error, len(b.recipients)+1)
+
+	for topic := range b.recipients {
 		wg.Add(1)
-		go func(w *worker) { errCh <- w.push(ev) }(b.workers[topic])
+		go func(w *recipient) { errCh <- w.push(ev) }(b.recipients[topic])
 	}
 
 	b.mu.Unlock()
@@ -340,12 +454,12 @@ func (b *Bus) sendEvent(ev Event) error {
 	for err := range errCh {
 		wg.Done()
 		if err != nil {
-			finalErr = append(finalErr, err)
+			errs = append(errs, err)
 		}
 	}
 
-	if len(finalErr) > 0 {
-		return errors.Join(finalErr...)
+	if len(errs) > 0 {
+		return errors.Join(errs...)
 	}
 
 	return nil
@@ -353,7 +467,7 @@ func (b *Bus) sendEvent(ev Event) error {
 
 func (b *Bus) sendEventTo(to string, ev Event) error {
 	b.mu.Lock()
-	if w, ok := b.workers[to]; ok {
+	if w, ok := b.recipients[to]; ok {
 		b.mu.Unlock()
 
 		errCh := make(chan error, 1)
@@ -373,7 +487,7 @@ func (b *Bus) doRequest(ctx context.Context, to, topic string, data any) (Reply,
 	ch := make(chan Reply)
 	defer close(ch)
 
-	ev := b.buildEvent(topic, data)
+	ev := b.buildEvent(ctx, topic, data)
 	ev.Reply = ch
 
 	if err := ctx.Err(); err != nil {
@@ -396,7 +510,7 @@ func (b *Bus) doRequest(ctx context.Context, to, topic string, data any) (Reply,
 	}
 }
 
-func eventFilterFunc(topics []any, fn EventHandler) EventHandler {
+func eventFilterFunc(topics []any, fn EventFunc) EventFunc {
 	var (
 		st []string
 		rt []*regexp.Regexp
@@ -427,7 +541,7 @@ func eventFilterFunc(topics []any, fn EventHandler) EventHandler {
 	}
 }
 
-func eventChanFilterFunc(topicFilters []any, ch EventChannel) EventHandler {
+func eventChanFilterFunc(topicFilters []any, ch EventChannel) EventFunc {
 	var (
 		st []string
 		rt []*regexp.Regexp
