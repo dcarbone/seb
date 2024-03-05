@@ -310,7 +310,12 @@ func (b *Bus) Push(ctx context.Context, topic string, data any) error {
 // PushAsync pushes an event to all recipients without blocking the caller.  You amy optionally provide errc if you
 // wish know about any / all errors that occurred during the push.  Otherwise, set errc to nil.
 func (b *Bus) PushAsync(ctx context.Context, topic string, data any, errc chan<- error) {
-	b.sendEventAsync(b.buildEvent(ctx, topic, data), errc)
+	ev := b.buildEvent(ctx, topic, data)
+	if errc == nil {
+		go func() { _ = b.sendEvent(ev) }()
+	} else {
+		go func() { errc <- b.sendEvent(ev) }()
+	}
 }
 
 // PushTo attempts to push an even to a specific recipient, blocking until completed.
@@ -320,7 +325,12 @@ func (b *Bus) PushTo(ctx context.Context, to, topic string, data any) error {
 
 // PushToAsync attempts to push an event to a specific recipient without blocking the caller.
 func (b *Bus) PushToAsync(ctx context.Context, to, topic string, data any, errc chan<- error) {
-	b.sendEventToAsync(to, b.buildEvent(ctx, topic, data), errc)
+	ev := b.buildEvent(ctx, topic, data)
+	if errc == nil {
+		go func() { _ = b.sendEventTo(to, ev) }()
+	} else {
+		go func() { errc <- b.sendEventTo(to, ev) }()
+	}
 }
 
 // Request will push a new event with the Reply chan defined, blocking until a single response has been received
@@ -476,14 +486,6 @@ func (b *Bus) sendEvent(ev Event) error {
 	return nil
 }
 
-func (b *Bus) sendEventAsync(ev Event, errc chan<- error) {
-	if errc == nil {
-		go func() { _ = b.sendEvent(ev) }()
-	} else {
-		go func() { errc <- b.sendEvent(ev) }()
-	}
-}
-
 func (b *Bus) sendEventTo(to string, ev Event) error {
 	b.mu.Lock()
 
@@ -495,14 +497,6 @@ func (b *Bus) sendEventTo(to string, ev Event) error {
 	b.mu.Unlock()
 
 	return fmt.Errorf("%w: %s", ErrRecipientNotFound, to)
-}
-
-func (b *Bus) sendEventToAsync(to string, ev Event, errc chan<- error) {
-	if errc == nil {
-		go func() { _ = b.sendEventTo(to, ev) }()
-	} else {
-		go func() { errc <- b.sendEventTo(to, ev) }()
-	}
 }
 
 func (b *Bus) doRequest(ctx context.Context, to, topic string, data any) (Reply, error) {
