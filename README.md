@@ -83,8 +83,9 @@ No recipient will prevent or even delay an event from being pushed to other reci
 force event recipients to be as expedient as possible in its implementation, as the rest of the Bus won't
 wait for it to handle one event before sending another. 
 
-### Global subscription
-For simplicity's sake, you either are listening or you aren't.  If you don't care about a topic, ignore the message.
+### Filtering
+When registering a recipient, you may optionally provide a list of string's of specific topics or `*regex.Regexp`
+instances.  Your recipient will then only receive events that pass through those filters.
 
 ### No external deps
 Only use stdlib modules
